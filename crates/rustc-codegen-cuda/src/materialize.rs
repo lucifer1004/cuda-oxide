@@ -26,11 +26,14 @@ pub(crate) const EXPECTED_PROVENANCE_ENV: &str =
 pub(crate) const MATERIALIZER_HANDSHAKE_ENV: &str =
     reserved_oxide_symbols::MATERIALIZER_HANDSHAKE_ENV;
 pub(crate) const CODEGEN_FINGERPRINT_ENV: &str = reserved_oxide_symbols::CODEGEN_FINGERPRINT_ENV;
+pub(crate) const CUDA_DEVICE_RUNTIME_DIGEST_ENV: &str =
+    reserved_oxide_symbols::CUDA_DEVICE_RUNTIME_DIGEST_ENV;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MaterializationRequest {
     expected_provenance: [u8; 32],
     tool_identity_handshake: cuda_artifact_finalizer::MaterializerHandshakeV1,
+    cuda_device_runtime_digest: Option<[u8; 32]>,
 }
 
 /// Cubin bytes plus ptxas resource diagnostics from the final link.
@@ -80,6 +83,16 @@ pub(crate) enum MaterializeError {
         "{EXPECTED_PROVENANCE_ENV} must be exactly 64 lowercase hexadecimal characters, got {value:?}"
     )]
     InvalidExpectedProvenance { value: String },
+
+    #[error(
+        "{MATERIALIZE_ENV}=true requires cargo-oxide's CUDA device-runtime digest in {CUDA_DEVICE_RUNTIME_DIGEST_ENV}"
+    )]
+    MissingCudaDeviceRuntimeDigest,
+
+    #[error(
+        "{CUDA_DEVICE_RUNTIME_DIGEST_ENV} must be exactly 64 lowercase hexadecimal characters, got {value:?}"
+    )]
+    InvalidCudaDeviceRuntimeDigest { value: String },
 
     #[error(
         "the loaded CUDA tools cannot be tied to exact files, so their provenance cannot be verified; refusing build-time cubin materialization"
@@ -146,10 +159,22 @@ pub(crate) fn request_from_env() -> Result<Option<MaterializationRequest>, Mater
             }
         })?;
     validate_tool_identity_handshake(expected_provenance, &handshake)?;
+    let cuda_device_runtime_digest = match std::env::var(CUDA_DEVICE_RUNTIME_DIGEST_ENV) {
+        Ok(value) => Some(parse_digest(&value).map_err(|_| {
+            MaterializeError::InvalidCudaDeviceRuntimeDigest { value }
+        })?),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(value)) => {
+            return Err(MaterializeError::InvalidCudaDeviceRuntimeDigest {
+                value: value.to_string_lossy().into_owned(),
+            });
+        }
+    };
     validate_codegen_fingerprint()?;
     Ok(Some(MaterializationRequest {
         expected_provenance,
         tool_identity_handshake: handshake,
+        cuda_device_runtime_digest,
     }))
 }
 
@@ -197,10 +222,23 @@ pub(crate) fn nvvm_ir_to_cubin(
     target: &str,
     allow_fma_contraction: bool,
     debug_policy: DebugPolicy,
+    requires_cuda_device_runtime: bool,
 ) -> Result<MaterializedCubin, MaterializeError> {
     let options = options(target, allow_fma_contraction, debug_policy)?;
     let finalizer = checked_finalizer(request)?;
-    let report = finalizer.materialize_nvvm_ir_with_report(module_name, nvvm_ir, &options)?;
+    let report = if requires_cuda_device_runtime {
+        let device_runtime_digest = request
+            .cuda_device_runtime_digest
+            .ok_or(MaterializeError::MissingCudaDeviceRuntimeDigest)?;
+        finalizer.materialize_nvvm_ir_with_device_runtime_report(
+            module_name,
+            nvvm_ir,
+            &options,
+            device_runtime_digest,
+        )?
+    } else {
+        finalizer.materialize_nvvm_ir_with_report(module_name, nvvm_ir, &options)?
+    };
     Ok(MaterializedCubin {
         bytes: report.image,
         resource_usage: report.resource_usage,
@@ -390,6 +428,7 @@ mod tests {
         let request = Some(MaterializationRequest {
             expected_provenance: handshake.provenance_sha256,
             tool_identity_handshake: handshake,
+            cuda_device_runtime_digest: Some([3; 32]),
         });
         assert!(matches!(
             validate_collection(request, false, true),

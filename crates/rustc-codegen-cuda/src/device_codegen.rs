@@ -307,6 +307,8 @@ pub struct DeviceCodegenResult {
     /// Auto-detected based on GPU features used, or overridden via
     /// `CUDA_OXIDE_TARGET` environment variable.
     pub target: String,
+    /// Whether final linking must include the CUDA device runtime.
+    pub requires_cuda_device_runtime: bool,
     /// PTX content as a string, ready for embedding in the host binary.
     ///
     /// NVVM IR / LTOIR flows intentionally skip PTX generation.
@@ -856,6 +858,7 @@ pub fn generate_device_code<'tcx>(
                     ptx_path: compilation_result.ptx_path,
                     ll_path: compilation_result.ll_path,
                     target: compilation_result.target,
+                    requires_cuda_device_runtime: compilation_result.requires_cuda_device_runtime,
                     ptx_content,
                     artifact,
                     allow_fma_contraction: compilation_result.allow_fma_contraction,
@@ -1000,6 +1003,7 @@ mod tests {
             artifact_path: ll_path,
             artifact_kind: mir_importer::CompilationArtifactKind::NvvmIr,
             target: "sm_90".to_string(),
+            requires_cuda_device_runtime: false,
             allow_fma_contraction: false,
             kernel_launch_bounds: BTreeMap::new(),
         };
@@ -1027,6 +1031,7 @@ mod tests {
             artifact_path: cubin_path,
             artifact_kind: mir_importer::CompilationArtifactKind::Cubin,
             target: "sm_90".to_string(),
+            requires_cuda_device_runtime: false,
             allow_fma_contraction: true,
             kernel_launch_bounds: BTreeMap::new(),
         };

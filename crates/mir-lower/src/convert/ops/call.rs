@@ -717,7 +717,8 @@ pub fn convert(
     {
         let resolved_name = resolve_device_extern_symbol(&callee_name);
         let parent_block = op.deref(ctx).get_parent_block();
-        if resolved_name.starts_with("__nv_")
+        if (resolved_name.starts_with("__nv_")
+            || resolved_name == dialect_mir::cuda_runtime::GRAPH_SET_CONDITIONAL_SYMBOL)
             && let Some(parent_block) = parent_block
         {
             let loc = op.deref(ctx).loc();
@@ -725,7 +726,7 @@ pub fn convert(
                 .map_err(|e| {
                     pliron::input_error!(
                         loc,
-                        "Failed to declare libdevice extern {resolved_name}: {e}"
+                        "Failed to declare CUDA external symbol {resolved_name}: {e}"
                     )
                 })?;
         }

@@ -10,6 +10,7 @@
 //! build-time materialization and runtime fallback use the same typed target,
 //! FMA, debug, input-order, validation, and provenance rules.
 
+mod device_runtime;
 mod diagnostics;
 mod link;
 mod nvvm;
@@ -18,6 +19,9 @@ mod provenance;
 mod ptx;
 mod validation;
 
+pub use device_runtime::{
+    CudaDeviceRuntimeNotFound, cuda_device_runtime_digest, find_cuda_device_runtime,
+};
 pub use diagnostics::KernelResourceUsage;
 pub use libnvvm_sys::{CudaArch, CudaArchParseError, LibdeviceNotFound, NvvmError, find_libdevice};
 pub use link::{LinkReport, LtoLinker};
@@ -31,6 +35,7 @@ pub use ptx::PtxAssembler;
 pub use validation::is_valid_cubin;
 
 use provenance::common_provenance_digest;
+use sha2::Digest as _;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -80,6 +85,10 @@ pub enum FinalizerError {
         /// Newline-separated discovery paths.
         tried: String,
     },
+
+    /// The CUDA device-runtime archive could not be located.
+    #[error(transparent)]
+    CudaDeviceRuntimeNotFound(#[from] CudaDeviceRuntimeNotFound),
 
     /// A finalizer input could not be read.
     #[error("Failed reading {path}: {source}")]
@@ -136,6 +145,12 @@ pub enum FinalizerError {
         "the pinned {tool} file changed before or during CUDA artifact finalization; refusing the unverified output"
     )]
     ToolIdentityChanged { tool: &'static str },
+
+    /// The CUDA device runtime changed after Cargo fingerprinted the build.
+    #[error(
+        "the CUDA device-runtime archive changed after Cargo fingerprinting (expected {expected}, loaded {actual})"
+    )]
+    DeviceRuntimeDigestMismatch { expected: String, actual: String },
 
     /// A serialized digest hint was internally inconsistent or from another
     /// protocol version.
@@ -229,6 +244,39 @@ impl Finalizer {
         )
     }
 
+    /// Compile NVVM IR and resolve CUDA device-runtime calls into a cubin.
+    pub fn materialize_nvvm_ir_with_device_runtime_report(
+        &self,
+        module_name: &str,
+        nvvm_ir: &[u8],
+        options: &FinalizationOptions,
+        expected_device_runtime_digest: [u8; 32],
+    ) -> Result<LinkReport, FinalizerError> {
+        let ltoir = self
+            .compiler
+            .compile_nvvm_ir_to_ltoir(module_name, nvvm_ir, options)?;
+        let ltoir_name = format!("{module_name}.ltoir");
+        let runtime_path = find_cuda_device_runtime()?;
+        let runtime = std::fs::read(&runtime_path).map_err(|source| FinalizerError::Io {
+            path: runtime_path.clone(),
+            source,
+        })?;
+        let actual_device_runtime_digest: [u8; 32] = sha2::Sha256::digest(&runtime).into();
+        if actual_device_runtime_digest != expected_device_runtime_digest {
+            return Err(FinalizerError::DeviceRuntimeDigestMismatch {
+                expected: digest_hex(&expected_device_runtime_digest),
+                actual: digest_hex(&actual_device_runtime_digest),
+            });
+        }
+        let runtime_name = runtime_path.to_string_lossy();
+        self.linker.link_ltoir_with_device_runtime_report(
+            &[NamedInput::new(&ltoir_name, &ltoir)],
+            NamedInput::new(&runtime_name, &runtime),
+            options,
+            FinalizerOutput::Cubin,
+        )
+    }
+
     /// Link ordered LTOIR modules to cubin or PTX.
     pub fn link_ltoir(
         &self,
@@ -301,6 +349,16 @@ impl Finalizer {
             self.provenance(),
         )
     }
+}
+
+fn digest_hex(digest: &[u8; 32]) -> String {
+    use std::fmt::Write;
+
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        write!(&mut hex, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    hex
 }
 
 /// Digest a complete finalization plan from already-established provenance.
