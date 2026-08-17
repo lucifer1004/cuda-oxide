@@ -15,6 +15,12 @@ use crate::{FinalizerError, validate_name};
 use nvjitlink_sys::{InputType, LibNvJitLink, LinkOutput, Linker, NvJitLinkError};
 use std::sync::{Arc, Mutex, OnceLock};
 
+#[derive(Clone, Copy)]
+struct TypedInput<'a> {
+    input: NamedInput<'a>,
+    kind: InputType,
+}
+
 struct LoadedLinkerTool {
     library: Arc<LibNvJitLink>,
     digest: Option<[u8; 32]>,
@@ -116,6 +122,31 @@ impl LtoLinker {
         self.link_ltoir_impl(inputs, options, output, true)
     }
 
+    /// Link ordered LTOIR modules with one CUDA device-runtime archive.
+    pub fn link_ltoir_with_device_runtime_report(
+        &self,
+        inputs: &[NamedInput<'_>],
+        device_runtime: NamedInput<'_>,
+        options: &FinalizationOptions,
+        output: FinalizerOutput,
+    ) -> Result<LinkReport, FinalizerError> {
+        validate_inputs(inputs)?;
+        validate_inputs(std::slice::from_ref(&device_runtime))?;
+        let mut typed = inputs
+            .iter()
+            .copied()
+            .map(|input| TypedInput {
+                input,
+                kind: InputType::Ltoir,
+            })
+            .collect::<Vec<_>>();
+        typed.push(TypedInput {
+            input: device_runtime,
+            kind: InputType::Library,
+        });
+        self.link_typed_inputs(&typed, options, output, true)
+    }
+
     fn link_ltoir_impl(
         &self,
         inputs: &[NamedInput<'_>],
@@ -164,12 +195,30 @@ impl LtoLinker {
         output: FinalizerOutput,
         collect_resource_usage: bool,
     ) -> Result<LinkReport, FinalizerError> {
+        let typed = inputs
+            .iter()
+            .copied()
+            .map(|input| TypedInput {
+                input,
+                kind: input_type,
+            })
+            .collect::<Vec<_>>();
+        self.link_typed_inputs(&typed, options, output, collect_resource_usage)
+    }
+
+    fn link_typed_inputs(
+        &self,
+        inputs: &[TypedInput<'_>],
+        options: &FinalizationOptions,
+        output: FinalizerOutput,
+        collect_resource_usage: bool,
+    ) -> Result<LinkReport, FinalizerError> {
         with_revalidated_tool_identity(
             "nvJitLink",
             self.tool.digest,
             || current_linker_tool_digest(&self.tool),
             || {
-                match self.run_link(inputs, input_type, options, output, collect_resource_usage) {
+                match self.run_link(inputs, options, output, collect_resource_usage) {
                     // Older nvJitLink versions reject the diagnostic-only
                     // reporting options with NVJITLINK_ERROR_UNRECOGNIZED_OPTION.
                     // The caller asked for the same program plus a best-effort
@@ -178,7 +227,7 @@ impl LtoLinker {
                     Err(FinalizerError::NvJitLink(error))
                         if collect_resource_usage && error.is_unrecognized_option() =>
                     {
-                        self.run_link(inputs, input_type, options, output, false)
+                        self.run_link(inputs, options, output, false)
                     }
                     result => result,
                 }
@@ -188,13 +237,15 @@ impl LtoLinker {
 
     fn run_link(
         &self,
-        inputs: &[NamedInput<'_>],
-        input_type: InputType,
+        inputs: &[TypedInput<'_>],
         options: &FinalizationOptions,
         output: FinalizerOutput,
         collect_resource_usage: bool,
     ) -> Result<LinkReport, FinalizerError> {
-        let mut option_storage = if input_type == InputType::Ptx {
+        let mut option_storage = if inputs
+            .iter()
+            .all(|input| matches!(input.kind, InputType::Ptx))
+        {
             options.nvjitlink_ptx_options()
         } else {
             options.nvjitlink_ltoir_options(output)
@@ -208,7 +259,7 @@ impl LtoLinker {
             .collect::<Vec<_>>();
         let mut linker = Linker::new(&self.tool.library, &option_refs)?;
         for input in inputs {
-            linker.add(input_type, input.bytes, input.name)?;
+            linker.add(input.kind, input.input.bytes, input.input.name)?;
         }
 
         let LinkOutput { image, info_log } = match output {

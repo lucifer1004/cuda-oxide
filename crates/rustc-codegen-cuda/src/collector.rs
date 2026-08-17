@@ -1490,6 +1490,12 @@ impl<'tcx> DeviceCollector<'tcx> {
 
         // Skip already-seen monomorphizations (use mangled name as unique key)
         let mangled = self.tcx.symbol_name(resolved).name.to_string();
+        if mangled == dialect_mir::cuda_runtime::GRAPH_SET_CONDITIONAL_SYMBOL {
+            if self.verbose {
+                eprintln!("[collector] Leaving CUDA device-runtime symbol unresolved: {mangled}");
+            }
+            return;
+        }
         if self.seen.contains(&mangled) {
             return;
         }

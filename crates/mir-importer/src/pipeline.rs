@@ -126,6 +126,8 @@ pub struct CompilationResult {
     pub artifact_kind: CompilationArtifactKind,
     /// GPU target architecture used (e.g., `sm_90a`, `sm_80`).
     pub target: String,
+    /// Whether final linking must include the CUDA device runtime.
+    pub requires_cuda_device_runtime: bool,
     /// Floating-point contraction policy that later compilation stages must
     /// preserve.
     pub allow_fma_contraction: bool,
@@ -385,6 +387,7 @@ pub fn run_pipeline(
                 ll_path,
                 ptx_path,
                 target: generated.target,
+                requires_cuda_device_runtime: generated.requires_cuda_device_runtime,
                 allow_fma_contraction: config.allow_fma_contraction,
                 kernel_launch_bounds,
             })
@@ -395,6 +398,7 @@ pub fn run_pipeline(
             ll_path,
             ptx_path,
             target: generated.target,
+            requires_cuda_device_runtime: generated.requires_cuda_device_runtime,
             allow_fma_contraction: config.allow_fma_contraction,
             kernel_launch_bounds,
         }),

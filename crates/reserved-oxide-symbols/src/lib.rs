@@ -71,6 +71,9 @@ pub const MATERIALIZER_PROVENANCE_ENV: &str = "CUDA_OXIDE_INTERNAL_MATERIALIZER_
 /// code remains keyed by the content-derived provenance digest.
 pub const MATERIALIZER_HANDSHAKE_ENV: &str = "CUDA_OXIDE_INTERNAL_MATERIALIZER_HANDSHAKE";
 
+/// Content digest of the CUDA device-runtime archive selected by cargo-oxide.
+pub const CUDA_DEVICE_RUNTIME_DIGEST_ENV: &str = "CUDA_OXIDE_INTERNAL_CUDA_DEVICE_RUNTIME_SHA256";
+
 /// Optional comma-separated filter selecting crates that may own device code.
 pub const DEVICE_CODEGEN_CRATE_ENV: &str = "CUDA_OXIDE_DEVICE_CODEGEN_CRATE";
 

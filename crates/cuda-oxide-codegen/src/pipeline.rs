@@ -159,6 +159,8 @@ pub struct ModulePipelineOutput {
     pub artifact_kind: ModuleArtifactKind,
     /// Concrete target selected from explicit options, the device hint, or IR features.
     pub target: String,
+    /// Whether final linking must resolve CUDA device-runtime calls.
+    pub requires_cuda_device_runtime: bool,
     /// Messages retained for the legacy CLI to print.
     pub diagnostics: Vec<String>,
 }
@@ -475,6 +477,7 @@ pub fn compile_translated_module(
             target: nvvm_target
                 .expect("NVVM target was resolved before export")
                 .sm(),
+            requires_cuda_device_runtime: backend_selection.requires_cuda_device_runtime,
             diagnostics: Vec::new(),
         });
     }
@@ -549,6 +552,7 @@ pub fn compile_translated_module(
     Ok(ModulePipelineOutput {
         artifact_kind: ModuleArtifactKind::Ptx,
         target: generated.target,
+        requires_cuda_device_runtime: backend_selection.requires_cuda_device_runtime,
         diagnostics: generated.diagnostics,
     })
 }
@@ -562,6 +566,8 @@ struct PreLoweringBackendSelection {
     /// is selected; on the NVPTX path they lower to native LLVM intrinsics
     /// instead.
     needs_libdevice: bool,
+    /// Whether final linking must include `libcudadevrt.a`.
+    requires_cuda_device_runtime: bool,
     /// Whether the pipeline must stop at NVVM IR instead of invoking `llc`.
     emit_nvvm_ir: bool,
     /// Intrinsic ABI to use during MIR-to-LLVM conversion.
@@ -601,8 +607,12 @@ fn select_pre_lowering_backend(
         module,
         &dialect_mir::rust_intrinsics::is_backend_dependent_libdevice_placeholder,
     );
-    let emit_nvvm_ir =
-        should_emit_nvvm_ir(output_policy, uses_strict_libdevice, can_ir_link_libdevice);
+    let requires_cuda_device_runtime = typed_mir_calls_match(ctx, module, &|callee| {
+        callee == dialect_mir::cuda_runtime::GRAPH_SET_CONDITIONAL_SYMBOL
+    });
+    let emit_nvvm_ir = (matches!(output_policy, OutputPolicy::ExternalLinkAllowed { .. })
+        && requires_cuda_device_runtime)
+        || should_emit_nvvm_ir(output_policy, uses_strict_libdevice, can_ir_link_libdevice);
     let intrinsic_backend = if emit_nvvm_ir {
         mir_lower::IntrinsicBackend::LibNvvm
     } else {
@@ -617,6 +627,7 @@ fn select_pre_lowering_backend(
 
     PreLoweringBackendSelection {
         needs_libdevice,
+        requires_cuda_device_runtime,
         emit_nvvm_ir,
         intrinsic_backend,
     }
@@ -904,6 +915,36 @@ mod tests {
             selection.intrinsic_backend,
             mir_lower::IntrinsicBackend::LlvmNvptx
         );
+    }
+
+    #[test]
+    fn cuda_device_runtime_call_requires_the_external_link_route() {
+        let mut ctx = Context::new();
+        let module = typed_mir_test_module(
+            &mut ctx,
+            &[dialect_mir::cuda_runtime::GRAPH_SET_CONDITIONAL_SYMBOL],
+        );
+        let linked = select_pre_lowering_backend(
+            &ctx,
+            module,
+            OutputPolicy::ExternalLinkAllowed {
+                request_nvvm_ir: false,
+            },
+            true,
+        );
+        assert!(linked.requires_cuda_device_runtime);
+        assert!(linked.emit_nvvm_ir);
+
+        let standalone = select_pre_lowering_backend(
+            &ctx,
+            module,
+            OutputPolicy::SelfContainedPtx {
+                allow_libdevice: true,
+            },
+            true,
+        );
+        assert!(standalone.requires_cuda_device_runtime);
+        assert!(!standalone.emit_nvvm_ir);
     }
 
     /// Rounding placeholders are backend-dependent: with PTX output they

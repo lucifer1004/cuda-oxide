@@ -997,6 +997,7 @@ fn materialize_artifact_for_embedding(
             &result.target,
             result.allow_fma_contraction,
             debug_policy,
+            result.requires_cuda_device_runtime,
         )?,
         device_codegen::DeviceCodegenArtifactKind::Ltoir => materialize::ltoir_to_cubin(
             request,

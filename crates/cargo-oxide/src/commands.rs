@@ -19,6 +19,7 @@ use std::process::Command;
 const MATERIALIZE_ENV: &str = reserved_oxide_symbols::MATERIALIZE_CUBIN_ENV;
 const EXPECTED_PROVENANCE_ENV: &str = reserved_oxide_symbols::MATERIALIZER_PROVENANCE_ENV;
 const MATERIALIZER_HANDSHAKE_ENV: &str = reserved_oxide_symbols::MATERIALIZER_HANDSHAKE_ENV;
+const CUDA_DEVICE_RUNTIME_DIGEST_ENV: &str = reserved_oxide_symbols::CUDA_DEVICE_RUNTIME_DIGEST_ENV;
 const CODEGEN_FINGERPRINT_ENV: &str = reserved_oxide_symbols::CODEGEN_FINGERPRINT_ENV;
 const DEVICE_CODEGEN_CRATE_ENV: &str = reserved_oxide_symbols::DEVICE_CODEGEN_CRATE_ENV;
 const BACKEND_IDENTITY_CFG: &str = "cuda_oxide_internal_backend_identity";
@@ -35,6 +36,7 @@ struct MaterializationMode {
 struct PreparedMaterialization {
     provenance_sha256_hex: String,
     tool_identity_handshake_json: String,
+    cuda_device_runtime_sha256_hex: Option<String>,
 }
 
 impl MaterializationMode {
@@ -53,6 +55,9 @@ impl MaterializationMode {
                     &prepared.tool_identity_handshake_json,
                 )
                 .env("CUDA_OXIDE_EMIT_NVVM_IR", "1");
+            if let Some(digest) = &prepared.cuda_device_runtime_sha256_hex {
+                cmd.env(CUDA_DEVICE_RUNTIME_DIGEST_ENV, digest);
+            }
         }
     }
 }
@@ -209,10 +214,17 @@ fn prepare_materialization_result_with_env(
     let handshake = discover_materializer_handshake(ctx)?;
     let handshake_json = serde_json::to_string(&handshake)
         .map_err(|error| format!("could not encode materializer handshake: {error}"))?;
+    let cuda_device_runtime_sha256_hex = cuda_artifact_finalizer::find_cuda_device_runtime()
+        .ok()
+        .map(|_| cuda_artifact_finalizer::cuda_device_runtime_digest())
+        .transpose()
+        .map_err(|error| format!("could not fingerprint the CUDA device runtime: {error}"))?
+        .map(|digest| digest_hex(&digest));
     Ok(MaterializationMode {
         prepared: Some(PreparedMaterialization {
             provenance_sha256_hex: digest_hex(&handshake.provenance_sha256),
             tool_identity_handshake_json: handshake_json,
+            cuda_device_runtime_sha256_hex,
         }),
     })
 }
@@ -3286,6 +3298,7 @@ fn passthrough_codegen_fingerprint_with_env(
     // Descriptor identity only accelerates verification; artifact identity is
     // already represented by the content-derived provenance above.
     effective_env.remove(MATERIALIZER_HANDSHAKE_ENV);
+    effective_env.remove(CUDA_DEVICE_RUNTIME_DIGEST_ENV);
 
     if opts.verbose {
         effective_env.insert("CUDA_OXIDE_VERBOSE".to_string(), b"1".to_vec());
@@ -3308,6 +3321,12 @@ fn passthrough_codegen_fingerprint_with_env(
             EXPECTED_PROVENANCE_ENV.to_string(),
             prepared.provenance_sha256_hex.as_bytes().to_vec(),
         );
+        if let Some(digest) = &prepared.cuda_device_runtime_sha256_hex {
+            effective_env.insert(
+                CUDA_DEVICE_RUNTIME_DIGEST_ENV.to_string(),
+                digest.as_bytes().to_vec(),
+            );
+        }
     }
     if let Some(target_arch) = target_arch {
         effective_env.insert(
@@ -9354,6 +9373,7 @@ device-owner = { path = "../device-owner" }
             prepared: Some(PreparedMaterialization {
                 provenance_sha256_hex: "ab".repeat(32),
                 tool_identity_handshake_json: "{\"version\":1}".to_string(),
+                cuda_device_runtime_sha256_hex: Some("cd".repeat(32)),
             }),
         };
         assert_ne!(
@@ -9584,6 +9604,7 @@ device-owner = { path = "../device-owner" }
             prepared: Some(PreparedMaterialization {
                 provenance_sha256_hex: "42".repeat(32),
                 tool_identity_handshake_json: "{\"version\":1}".to_string(),
+                cuda_device_runtime_sha256_hex: Some("24".repeat(32)),
             }),
         };
 
