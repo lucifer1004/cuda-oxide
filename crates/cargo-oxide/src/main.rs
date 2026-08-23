@@ -178,6 +178,13 @@ enum Commands {
         /// Comma-separated list of features to enable only for metadata-declared device crates
         #[arg(long)]
         device_features: Option<String>,
+        /// Produce the device artifacts and stop, without building the host crate
+        /// that consumes them. Use when the host crate cannot compile until the
+        /// caller has placed the freshly built artifact somewhere of its own
+        /// choosing, which an interop build cannot do for it because the host
+        /// build runs before this command returns.
+        #[arg(long)]
+        device_only: bool,
         /// Show verbose compilation output
         #[arg(short, long)]
         verbose: bool,
@@ -740,6 +747,7 @@ fn main() {
             arch,
             features,
             device_features,
+            device_only,
             verbose,
             no_fmad,
             unchecked_indexing,
@@ -775,6 +783,7 @@ fn main() {
                     arch.as_deref(),
                     features.as_deref(),
                     device_features.as_deref(),
+                    device_only,
                     no_fmad,
                     unchecked_indexing,
                     commands::DeviceDebug::from_flags(lineinfo, device_debug),

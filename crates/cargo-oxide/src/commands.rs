@@ -1506,6 +1506,7 @@ fn codegen_build_interop(
     arch: Option<&str>,
     features: Option<&str>,
     device_features: Option<&str>,
+    device_only: bool,
     no_fmad: bool,
     unchecked_indexing: bool,
     materialization: &MaterializationMode,
@@ -1533,6 +1534,12 @@ fn codegen_build_interop(
         InteropDeviceBuildOptions::standard(no_fmad, unchecked_indexing),
         materialization,
     );
+    if device_only {
+        println!(
+            "Device artifacts built; skipping the host crate because --device-only was requested."
+        );
+        return;
+    }
     run_host_cargo(
         ctx,
         example,
@@ -2695,6 +2702,7 @@ pub fn codegen_build(
     arch: Option<&str>,
     features: Option<&str>,
     device_features: Option<&str>,
+    device_only: bool,
     no_fmad: bool,
     unchecked_indexing: bool,
     device_debug: DeviceDebug,
@@ -2721,11 +2729,19 @@ pub fn codegen_build(
             target_arch,
             features,
             device_features,
+            device_only,
             no_fmad,
             unchecked_indexing,
             &materialization,
         );
         return;
+    }
+    if device_only {
+        eprintln!(
+            "Error: --device-only requires metadata-declared interop device crates; a plain \
+             codegen build has no separate host crate to skip."
+        );
+        std::process::exit(2);
     }
     if device_features.is_some() {
         eprintln!("Error: --device-features requires metadata-declared interop device crates.");
@@ -2847,6 +2863,7 @@ pub fn codegen_inspect_ptx(
         arch,
         features,
         None,
+        false,
         no_fmad,
         unchecked_indexing,
         device_debug,
@@ -2922,6 +2939,7 @@ pub fn emit_ltoir(
         Some(&sm_arch),
         features,
         None,
+        false,
         no_fmad,
         unchecked_indexing,
         device_debug,
