@@ -176,7 +176,7 @@ pub enum IntrinsicBackend {
 }
 
 /// Options controlling the `dialect-mir` to LLVM dialect lowering pass.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoweringOptions {
     /// Whether ordinary floating-point multiply/add or multiply/subtract
     /// expressions may contract into fused operations.
@@ -202,6 +202,9 @@ pub struct LoweringOptions {
     /// `rustc-codegen-cuda` passes the crate's `StableCrateId` hash. `None`
     /// preserves the undecorated historical names.
     pub module_disambiguator: Option<u64>,
+    /// Concrete CUDA target when lowering depends on an architecture-specific
+    /// PTX form. `None` keeps target-independent historical lowering.
+    pub target_arch: Option<cuda_target_spec::CudaArch>,
 }
 
 impl Default for LoweringOptions {
@@ -210,6 +213,7 @@ impl Default for LoweringOptions {
             allow_fma_contraction: true,
             intrinsic_backend: IntrinsicBackend::LlvmNvptx,
             module_disambiguator: None,
+            target_arch: None,
         }
     }
 }
