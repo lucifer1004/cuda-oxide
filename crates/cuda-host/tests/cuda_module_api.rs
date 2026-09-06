@@ -450,6 +450,40 @@ fn generated_cuda_module_api_typechecks() {
     let _ = generated_prepared_owned_async_methods_are_immutable_operations;
 }
 
+#[test]
+fn concrete_kernel_signature_matches_typed_launcher_packet() {
+    use cuda_host::{CudaKernelParameterKind as Parameter, CudaKernelScalarKind as Scalar};
+
+    let signature = kernels::SCALAR_ARGS_CUDA_SIGNATURE;
+    assert_eq!(signature.name, "scalar_args");
+    assert_eq!(signature.parameters.len(), 5);
+    assert_eq!(signature.parameters[0].name, "scale");
+    assert_eq!(signature.parameters[0].kind, Parameter::Scalar(Scalar::F32));
+    assert_eq!(signature.parameters[1].name, "params");
+    assert_eq!(
+        signature.parameters[1].kind,
+        Parameter::Scalar(Scalar::Opaque {
+            size: core::mem::size_of::<AffineParams>(),
+            alignment: core::mem::align_of::<AffineParams>(),
+        })
+    );
+    assert_eq!(signature.parameters[2].kind, Parameter::DevicePointer);
+    assert_eq!(
+        signature.parameters[3].kind,
+        Parameter::DeviceSlice {
+            writable: false,
+            row_width: false,
+        }
+    );
+    assert_eq!(
+        signature.parameters[4].kind,
+        Parameter::DeviceSlice {
+            writable: true,
+            row_width: false,
+        }
+    );
+}
+
 // =============================================================================
 // PTX naming contract
 //
