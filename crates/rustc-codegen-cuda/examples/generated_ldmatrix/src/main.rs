@@ -108,9 +108,8 @@ mod kernels {
         // - lane `n` supplies row `n % 8` of matrix `n / 8`, as x4 requires;
         // - each address points to a live, initialized, 16-byte-aligned row;
         // - the barrier above orders the shared-memory writes before the load.
-        let shared_address = unsafe {
-            cvta_generic_to_shared_u32(shared.add(row_word).cast_const().cast::<u8>())
-        };
+        let shared_address =
+            unsafe { cvta_generic_to_shared_u32(shared.add(row_word).cast_const().cast::<u8>()) };
         let registers = unsafe { ldmatrix_x4_shared_u32(shared_address) };
 
         // Result register m contains matrix m, row lane/4, column pair lane%4.
