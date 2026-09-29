@@ -1410,6 +1410,67 @@ where
     unsafe { smem.read() }
 }
 
+/// Reduce across a thread block of exactly `NUM_WARPS` complete warps.
+///
+/// The same result as [`block_reduce`], without its runtime shape work: the
+/// block size is the compile-time `NUM_WARPS * 32`, so no lane reads the
+/// launch dimensions, checks the scratch capacity, or branches on a partial
+/// final warp. Use it where that work is a measurable part of a short
+/// kernel.
+///
+/// # Safety
+///
+/// The launched block must have exactly `NUM_WARPS * 32` threads. `smem` and
+/// the calling threads are as for [`block_reduce`]: one live `static mut
+/// SharedArray` in the current block, used by every thread of the block and
+/// by nothing else until all callers have finished.
+#[inline(always)]
+pub unsafe fn block_reduce_warps<T, Op, const NUM_WARPS: usize>(
+    block: &ThreadBlock,
+    value: T,
+    smem: *mut SharedArray<T, NUM_WARPS>,
+) -> T
+where
+    T: WarpShuffle,
+    Op: ops::ReduceOp<T>,
+{
+    const {
+        assert!(
+            NUM_WARPS > 0 && NUM_WARPS <= 32,
+            "block_reduce_warps requires 1..=32 warps (block size 32..=1024)",
+        );
+    }
+
+    // SAFETY: the caller provides the block's shared allocation and a block
+    // of exactly NUM_WARPS warps; one lane publishes each slot and barriers
+    // separate the phases.
+    let smem = unsafe { SharedArray::as_raw_mut_ptr(smem) };
+    let warp = WarpTile::<32> { _priv: () };
+    let lane = warp::lane_id();
+    let warp_id = warp_in_block_linear();
+
+    let warp_total = warp_reduce::<T, Op, 32>(&warp, value);
+    if lane == 0 {
+        unsafe { smem.add(warp_id as usize).write(warp_total) };
+    }
+    block.sync();
+
+    if warp_id == 0 {
+        let v: T = if (lane as usize) < NUM_WARPS {
+            unsafe { smem.add(lane as usize).read() }
+        } else {
+            <Op as ops::ReduceOp<T>>::identity()
+        };
+        let block_total = warp_reduce::<T, Op, 32>(&warp, v);
+        if lane == 0 {
+            unsafe { smem.write(block_total) };
+        }
+    }
+    block.sync();
+
+    unsafe { smem.read() }
+}
+
 /// Inclusive scan across a thread block. Thread `i` (in linear order
 /// `(z * blockDim.y + y) * blockDim.x + x`) receives the reduction of
 /// values from threads `0..=i`.
