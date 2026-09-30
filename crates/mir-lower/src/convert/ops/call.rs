@@ -723,6 +723,13 @@ pub fn convert(
     let (flattened_args, flattened_arg_types) =
         flatten_arguments(ctx, rewriter, &args, operands_info, expected_param_tys)?;
 
+    let device_runtime_api =
+        dialect_mir::cuda_runtime::device_runtime_api(&resolve_device_extern_symbol(&callee_name));
+    if let Some(api) = device_runtime_api {
+        check_device_runtime_signature(ctx, api, &flattened_arg_types, result_type)
+            .map_err(|mismatch| pliron::input_error!(op.deref(ctx).loc(), "{mismatch}"))?;
+    }
+
     let func_type = llvm_types::FuncType::get(ctx, result_type, flattened_arg_types, false);
 
     // Direct libdevice calls (`__nv_*`) originate from hand-written externs
@@ -735,7 +742,10 @@ pub fn convert(
     {
         let resolved_name = resolve_device_extern_symbol(&callee_name);
         let parent_block = op.deref(ctx).get_parent_block();
-        if resolved_name.starts_with("__nv_")
+        // An admitted CUDA device runtime API likewise has no body; its
+        // registry entry names who resolves it. Its signature was checked
+        // against the API's C ABI above.
+        if (resolved_name.starts_with("__nv_") || device_runtime_api.is_some())
             && let Some(parent_block) = parent_block
         {
             let loc = op.deref(ctx).loc();
@@ -743,7 +753,7 @@ pub fn convert(
                 .map_err(|e| {
                     pliron::input_error!(
                         loc,
-                        "Failed to declare libdevice extern {resolved_name}: {e}"
+                        "Failed to declare external device symbol {resolved_name}: {e}"
                     )
                 })?;
         }
@@ -1981,6 +1991,38 @@ fn find_callee_arg_types(
     }
 
     None
+}
+
+/// Check a lowered call against an admitted device runtime API's C ABI, so a
+/// mistyped Rust declaration fails here instead of at run time.
+fn check_device_runtime_signature(
+    ctx: &Context,
+    api: &dialect_mir::cuda_runtime::DeviceRuntimeApi,
+    args: &[TypeHandle],
+    result: TypeHandle,
+) -> std::result::Result<(), String> {
+    let width = |ty: TypeHandle| {
+        ty.deref(ctx)
+            .downcast_ref::<IntegerType>()
+            .map(IntegerType::width)
+    };
+    let params_match = args.len() == api.params.len()
+        && args
+            .iter()
+            .zip(api.params)
+            .all(|(&arg, param)| width(arg) == Some(param.bits()));
+    let result_matches = match api.returns {
+        None => result.deref(ctx).is::<llvm_types::VoidType>(),
+        Some(scalar) => width(result) == Some(scalar.bits()),
+    };
+    if params_match && result_matches {
+        Ok(())
+    } else {
+        Err(format!(
+            "call to CUDA device runtime API `{}` does not match its C signature ({:?} -> {:?})",
+            api.symbol, api.params, api.returns
+        ))
+    }
 }
 
 /// Resolve a device-extern symbol name by stripping the internal prefix.
