@@ -47,6 +47,7 @@ pub struct FinalizationOptions {
     target: CudaArch,
     allow_fma_contraction: bool,
     debug: DebugPolicy,
+    device_runtime: bool,
 }
 
 impl FinalizationOptions {
@@ -56,7 +57,22 @@ impl FinalizationOptions {
             target,
             allow_fma_contraction: true,
             debug: DebugPolicy::None,
+            device_runtime: false,
         }
+    }
+
+    /// Select whether the link resolves CUDA device runtime calls against the
+    /// toolkit's device runtime archive (`libcudadevrt.a`). Only an LTOIR link
+    /// to cubin can include it.
+    #[must_use]
+    pub fn with_device_runtime(mut self, link: bool) -> Self {
+        self.device_runtime = link;
+        self
+    }
+
+    /// Whether the link includes the CUDA device runtime archive.
+    pub fn links_device_runtime(&self) -> bool {
+        self.device_runtime
     }
 
     /// Select whether multiply-add contraction is permitted.

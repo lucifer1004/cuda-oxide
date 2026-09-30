@@ -325,6 +325,8 @@ pub struct DeviceCodegenResult {
     pub debug_kind: llvm_export::export::DebugKind,
     /// Source launch bounds for kernel entries, keyed by exported kernel name.
     pub kernel_launch_bounds: BTreeMap<String, mir_importer::KernelLaunchBounds>,
+    /// What the artifact's final device link must include.
+    pub link_requirements: cuda_artifact_finalizer::LinkRequirements,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1293,6 +1295,7 @@ pub fn generate_device_code<'tcx>(
                     allow_fma_contraction: compilation_result.allow_fma_contraction,
                     debug_kind,
                     kernel_launch_bounds: compilation_result.kernel_launch_bounds,
+                    link_requirements: compilation_result.link_requirements,
                 })
             }
             Err(pipeline_err) => Err(DeviceCodegenError::PtxGeneration(format!(
@@ -1434,6 +1437,7 @@ mod tests {
             target: "sm_90".to_string(),
             allow_fma_contraction: false,
             kernel_launch_bounds: BTreeMap::new(),
+            link_requirements: cuda_artifact_finalizer::LinkRequirements::default(),
         };
 
         let artifact = read_compilation_artifact(&result).unwrap().unwrap();
@@ -1461,6 +1465,7 @@ mod tests {
             target: "sm_90".to_string(),
             allow_fma_contraction: true,
             kernel_launch_bounds: BTreeMap::new(),
+            link_requirements: cuda_artifact_finalizer::LinkRequirements::default(),
         };
 
         let artifact = read_compilation_artifact(&result).unwrap().unwrap();

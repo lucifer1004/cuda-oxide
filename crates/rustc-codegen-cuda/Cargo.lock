@@ -546,6 +546,7 @@ dependencies = [
 name = "nvjitlink-sys"
 version = "0.2.1"
 dependencies = [
+ "libc",
  "libloading",
  "thiserror",
 ]

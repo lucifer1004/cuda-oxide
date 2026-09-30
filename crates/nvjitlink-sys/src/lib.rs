@@ -180,6 +180,7 @@ impl NvJitLinkError {
 /// its own symbols.
 pub struct LibNvJitLink {
     _lib: Library,
+    loaded_path: Option<PathBuf>,
     loaded_file: Option<File>,
     loaded_identity: Option<LibraryFileIdentity>,
     create:
@@ -296,13 +297,20 @@ impl LibNvJitLink {
         })?;
         let OpenedLibrary {
             library: lib,
+            path,
             loaded_file,
             loaded_identity,
         } = opened;
 
         unsafe {
+            let create: unsafe extern "C" fn(
+                *mut NvJitLinkHandle,
+                u32,
+                *const *const c_char,
+            ) -> NvJitLinkResult = resolve(&lib, "nvJitLinkCreate")?;
+            let loaded_path = path.or_else(|| symbol_file_path(create as *const c_void));
             Ok(LibNvJitLink {
-                create: resolve(&lib, "nvJitLinkCreate")?,
+                create,
                 destroy: resolve(&lib, "nvJitLinkDestroy")?,
                 add_data: resolve(&lib, "nvJitLinkAddData")?,
                 complete: resolve(&lib, "nvJitLinkComplete")?,
@@ -317,11 +325,21 @@ impl LibNvJitLink {
                 get_info_log_size: resolve(&lib, "nvJitLinkGetInfoLogSize")?,
                 get_info_log: resolve(&lib, "nvJitLinkGetInfoLog")?,
                 version: resolve_optional(&lib, "nvJitLinkVersion"),
+                loaded_path,
                 loaded_file,
                 loaded_identity,
                 _lib: lib,
             })
         }
+    }
+
+    /// Canonical path of the loaded nvJitLink library: the file opened when a
+    /// concrete path was probed, or, for a library loaded by SONAME, the file
+    /// the dynamic loader chose. Companion toolkit files (the CUDA device
+    /// runtime archive) are taken from its directory so that they come from
+    /// the same toolkit as the linker.
+    pub fn loaded_path(&self) -> Option<&Path> {
+        self.loaded_path.as_deref()
     }
 
     /// Return the exact file descriptor used to load nvJitLink, provided that
@@ -716,6 +734,7 @@ impl LibraryFileIdentity {
 
 struct OpenedLibrary {
     library: Library,
+    path: Option<PathBuf>,
     loaded_file: Option<File>,
     loaded_identity: Option<LibraryFileIdentity>,
 }
@@ -746,6 +765,7 @@ fn open_library(tried: &mut Vec<String>, retain_exact_file: bool) -> Option<Open
         if let Ok(lib) = unsafe { Library::new(soname) } {
             return Some(OpenedLibrary {
                 library: lib,
+                path: None,
                 loaded_file: None,
                 loaded_identity: None,
             });
@@ -776,6 +796,7 @@ fn open_library_path(path: &Path, retain_exact_file: bool) -> Option<OpenedLibra
             let identity = identity.filter(|identity| identity.matches_file(&file));
             return Some(OpenedLibrary {
                 library: lib,
+                path: Some(canonical_path.to_path_buf()),
                 loaded_file: Some(file),
                 loaded_identity: identity,
             });
@@ -785,11 +806,30 @@ fn open_library_path(path: &Path, retain_exact_file: bool) -> Option<OpenedLibra
     let lib = unsafe { Library::new(path) }.ok()?;
     Some(OpenedLibrary {
         library: lib,
+        path: path.canonicalize().ok(),
         // Loading by pathname cannot prove which mapping the dynamic loader
         // returned when another handle already exists for that pathname.
         loaded_file: None,
         loaded_identity: None,
     })
+}
+
+/// Canonical path of the shared object that defines `symbol`.
+fn symbol_file_path(symbol: *const c_void) -> Option<PathBuf> {
+    let mut info = std::mem::MaybeUninit::<libc::Dl_info>::zeroed();
+    // SAFETY: `dladdr` only reads the address and fills `info`.
+    if unsafe { libc::dladdr(symbol, info.as_mut_ptr()) } == 0 {
+        return None;
+    }
+    // SAFETY: a nonzero return filled `info`.
+    let info = unsafe { info.assume_init() };
+    if info.dli_fname.is_null() {
+        return None;
+    }
+    // SAFETY: `dli_fname` is a NUL-terminated string owned by the loader.
+    let name = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) };
+    let name = <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(name.to_bytes());
+    Path::new(name).canonicalize().ok()
 }
 
 fn cuda_roots() -> Vec<PathBuf> {
@@ -1115,6 +1155,20 @@ mod tests {
             error.is_unrecognized_option(),
             "expected NVJITLINK_ERROR_UNRECOGNIZED_OPTION, got: {error}"
         );
+    }
+
+    #[test]
+    #[ignore = "requires an installed CUDA Toolkit with nvJitLink"]
+    fn installed_toolkit_reports_the_loaded_library_file_for_every_load_mode() {
+        for library in [
+            LibNvJitLink::load().expect("load nvJitLink"),
+            LibNvJitLink::load_for_cache().expect("load nvJitLink for cache"),
+        ] {
+            let path = library.loaded_path().expect("loaded nvJitLink has a file");
+            assert!(path.is_absolute() && path.is_file(), "{}", path.display());
+            let name = path.file_name().unwrap().to_string_lossy();
+            assert!(name.starts_with("libnvJitLink.so"), "{name}");
+        }
     }
 
     #[test]

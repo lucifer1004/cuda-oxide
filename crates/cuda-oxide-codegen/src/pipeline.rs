@@ -203,6 +203,9 @@ pub struct ModulePipelineOutput {
     pub target: String,
     /// Messages retained for the legacy CLI to print.
     pub diagnostics: Vec<String>,
+    /// The module calls CUDA device runtime APIs, so its final link must
+    /// include the device runtime archive. Only NVVM IR output can carry this.
+    pub requires_device_runtime: bool,
 }
 
 /// Compile an already-translated `dialect-mir` module to PTX or NVVM IR.
@@ -547,6 +550,7 @@ pub fn compile_translated_module(
                 .expect("NVVM target was resolved before export")
                 .sm(),
             diagnostics: Vec::new(),
+            requires_device_runtime: false,
         });
     }
 
@@ -623,6 +627,7 @@ pub fn compile_translated_module(
         artifact_kind: ModuleArtifactKind::Ptx,
         target: generated.target,
         diagnostics: generated.diagnostics,
+        requires_device_runtime: false,
     })
 }
 

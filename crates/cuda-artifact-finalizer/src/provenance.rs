@@ -28,6 +28,9 @@ pub struct ToolProvenance {
     pub nvjitlink_sha256: Option<[u8; 32]>,
     /// SHA-256 of the exact libdevice bytes added to libNVVM.
     pub libdevice_sha256: [u8; 32],
+    /// Digest of the device runtime archive bytes, for a link that includes
+    /// it.
+    pub cuda_device_runtime_sha256: Option<[u8; 32]>,
 }
 
 /// Stable identity of the open file descriptor whose contents were hashed.

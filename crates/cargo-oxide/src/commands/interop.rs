@@ -505,7 +505,25 @@ fn finalize_interop_device_artifact(
                 );
                 std::process::exit(1);
             });
-            let options = finalization_options_from_artifact(&target, compile_options);
+            let requires_path = ir_path.with_extension("requires");
+            let requires_text = std::fs::read_to_string(&requires_path).unwrap_or_else(|error| {
+                eprintln!(
+                    "Error: could not read emitted link requirements at {}: {error}",
+                    requires_path.display()
+                );
+                std::process::exit(1);
+            });
+            let requirements =
+                cuda_artifact_finalizer::LinkRequirements::parse_sidecar(&requires_text)
+                    .unwrap_or_else(|| {
+                        eprintln!(
+                            "Error: unsupported link requirements at {} (rebuild cargo-oxide with the compiler that emitted them)",
+                            requires_path.display()
+                        );
+                        std::process::exit(1);
+                    });
+            let options =
+                requirements.apply(finalization_options_from_artifact(&target, compile_options));
             let cubin = finalizer
                 .materialize_nvvm_ir(artifact_name, &ir, &options, &expected_kernels)
                 .unwrap_or_else(|error| {

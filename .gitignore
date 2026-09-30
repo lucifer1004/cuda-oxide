@@ -8,6 +8,7 @@ target/
 *.target
 *.options
 *.kernels
+*.requires
 .ltoir_arch
 *.ll
 *.bc

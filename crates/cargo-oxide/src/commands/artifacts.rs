@@ -112,6 +112,7 @@ pub(super) const GENERATED_ARTIFACT_SUFFIXES: &[&str] = &[
     "target",
     "options",
     "kernels",
+    "requires",
     "cubin.target",
 ];
 

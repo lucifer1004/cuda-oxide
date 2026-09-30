@@ -90,6 +90,13 @@ pub fn parse_expected_kernels_sidecar(text: &str) -> Option<Vec<String>> {
 /// its symbol table cannot be read. An image without a symbol table defines
 /// no entries.
 pub fn cubin_entry_names(bytes: &[u8]) -> Option<Vec<String>> {
+    symbols(bytes, |info, other, _| {
+        info & 0xf == SYMBOL_TYPE_FUNCTION && other & STO_CUDA_ENTRY != 0
+    })
+}
+
+/// Names of the symbols whose `(st_info, st_other, st_shndx)` satisfy `keep`.
+fn symbols(bytes: &[u8], keep: impl Fn(u8, u8, u16) -> bool) -> Option<Vec<String>> {
     let section_offset = usize::try_from(read_u64(bytes, 40)?).ok()?;
     let section_count = usize::from(read_u16(bytes, 60)?);
     let section = |index: usize| -> Option<usize> {
@@ -111,9 +118,8 @@ pub fn cubin_entry_names(bytes: &[u8]) -> Option<Vec<String>> {
             return None;
         }
         for symbol in symbols {
-            let info = symbol[4];
-            let other = symbol[5];
-            if info & 0xf != SYMBOL_TYPE_FUNCTION || other & STO_CUDA_ENTRY == 0 {
+            let section = read_u16(symbol, 6)?;
+            if !keep(symbol[4], symbol[5], section) {
                 continue;
             }
             let name_offset = usize::try_from(read_u32(symbol, 0)?).ok()?;

@@ -183,6 +183,8 @@ pub struct CompilationResult {
     pub allow_fma_contraction: bool,
     /// Per-kernel source launch bounds preserved for post-link diagnostics.
     pub kernel_launch_bounds: BTreeMap<String, KernelLaunchBounds>,
+    /// What the artifact's final device link must include.
+    pub link_requirements: cuda_artifact_finalizer::LinkRequirements,
 }
 
 /// Configuration for the compilation pipeline.
@@ -621,6 +623,14 @@ pub fn run_pipeline(
                 config.debug_kind,
             )?;
             write_expected_kernels_sidecar(&config.output_dir, &config.output_name, functions)?;
+            let link_requirements = cuda_artifact_finalizer::LinkRequirements {
+                device_runtime: generated.requires_device_runtime,
+            };
+            write_link_requirements_sidecar(
+                &config.output_dir,
+                &config.output_name,
+                link_requirements,
+            )?;
             // Publish the target last: its version marker is the completion record
             // that says the sibling options file is required.
             write_nvvm_target_sidecar(&config.output_dir, &config.output_name, &generated.target)?;
@@ -632,6 +642,7 @@ pub fn run_pipeline(
                 target: generated.target,
                 allow_fma_contraction: config.allow_fma_contraction,
                 kernel_launch_bounds,
+                link_requirements,
             })
         }
         ModuleArtifactKind::Ptx => Ok(CompilationResult {
@@ -642,6 +653,9 @@ pub fn run_pipeline(
             target: generated.target,
             allow_fma_contraction: config.allow_fma_contraction,
             kernel_launch_bounds,
+            // PTX output cannot include the device runtime archive; codegen
+            // selects NVVM IR for a module that calls it.
+            link_requirements: cuda_artifact_finalizer::LinkRequirements::default(),
         }),
     }
 }
@@ -759,6 +773,22 @@ fn write_expected_kernels_sidecar(
     })
 }
 
+/// Records, next to the emitted `.ll`, what its final device link must
+/// include.
+fn write_link_requirements_sidecar(
+    output_dir: &Path,
+    output_name: &str,
+    requirements: cuda_artifact_finalizer::LinkRequirements,
+) -> Result<(), PipelineError> {
+    let path = output_dir.join(format!("{output_name}.requires"));
+    std::fs::write(&path, requirements.sidecar_text()).map_err(|error| {
+        PipelineError::Export(format!(
+            "failed to record link requirements in {}: {error}",
+            path.display()
+        ))
+    })
+}
+
 fn stale_compilation_artifact_paths(
     output_dir: &Path,
     output_name: &str,
@@ -771,6 +801,7 @@ fn stale_compilation_artifact_paths(
         "target",
         "options",
         "kernels",
+        "requires",
         "ltoir",
         "cubin",
         "cubin.target",

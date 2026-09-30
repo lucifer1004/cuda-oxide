@@ -77,8 +77,8 @@
 use crate::ltoir_cache::{BuiltArtifacts, CacheResult, cache_or_build};
 use cuda_artifact_finalizer::{
     CudaArch, CudaArchParseError, FinalizationOptions, Finalizer, FinalizerError, FinalizerOutput,
-    LtoLinker, NamedInput, NvJitLinkError, NvvmError, parse_expected_kernels_sidecar,
-    require_expected_kernels,
+    LinkRequirements, LtoLinker, NamedInput, NvJitLinkError, NvvmError,
+    parse_expected_kernels_sidecar, require_expected_kernels,
 };
 #[cfg(test)]
 use cuda_artifact_finalizer::{
@@ -279,6 +279,7 @@ fn build_cubin_from_ll_file(ll_path: &Path, arch: &CudaArch) -> Result<FileCubin
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
+    let requirements = read_link_requirements(ll_path)?;
     validate_ir_target_sidecar(ll_path, arch)?;
     // Record the supplied target for older or manually created `.ll` files.
     // The sibling `.ltoir` can then be loaded after the `.ll` is removed.
@@ -292,13 +293,12 @@ fn build_cubin_from_ll_file(ll_path: &Path, arch: &CudaArch) -> Result<FileCubin
     let ltoir_path = dir.join(format!("{stem}.ltoir"));
     let cubin_path = dir.join(format!("{stem}.cubin"));
 
-    let cached = cached_nvvm_ir_to_cubin_with_compile_options(
+    let cached = cached_nvvm_ir_to_cubin_with_options(
         dir,
         &ll_bytes,
         &ll_path.display().to_string(),
         &ltoir_path.display().to_string(),
-        arch,
-        compile_options,
+        &requirements.apply(finalization_options(arch, compile_options)),
         &expected_kernels,
     )?;
     let ltoir = cached
@@ -617,33 +617,30 @@ fn cached_nvvm_ir_to_cubin(
     arch: &CudaArch,
     expected_kernels: &[&str],
 ) -> Result<CacheResult, LtoirError> {
-    cached_nvvm_ir_to_cubin_with_compile_options(
+    cached_nvvm_ir_to_cubin_with_options(
         source_dir,
         nvvm_ir,
         nvvm_module_name,
         ltoir_module_name,
-        arch,
-        ArtifactCompileOptions::new(),
+        &finalization_options(arch, ArtifactCompileOptions::new()),
         expected_kernels,
     )
 }
 
-fn cached_nvvm_ir_to_cubin_with_compile_options(
+fn cached_nvvm_ir_to_cubin_with_options(
     source_dir: &Path,
     nvvm_ir: &[u8],
     nvvm_module_name: &str,
     ltoir_module_name: &str,
-    arch: &CudaArch,
-    compile_options: ArtifactCompileOptions,
+    options: &FinalizationOptions,
     expected_kernels: &[&str],
 ) -> Result<CacheResult, LtoirError> {
     let finalizer = Finalizer::discover()?;
-    let options = finalization_options(arch, compile_options);
     let key = finalizer.nvvm_ir_artifact_digest(
         nvvm_module_name,
         ltoir_module_name,
         nvvm_ir,
-        &options,
+        options,
         FinalizerOutput::Cubin,
     );
 
@@ -651,10 +648,10 @@ fn cached_nvvm_ir_to_cubin_with_compile_options(
         let ltoir =
             finalizer
                 .compiler()
-                .compile_nvvm_ir_to_ltoir(nvvm_module_name, nvvm_ir, &options)?;
+                .compile_nvvm_ir_to_ltoir(nvvm_module_name, nvvm_ir, options)?;
         let cubin = finalizer.link_ltoir(
             &[NamedInput::new(ltoir_module_name, &ltoir)],
-            &options,
+            options,
             FinalizerOutput::Cubin,
             expected_kernels,
         )?;
@@ -679,31 +676,28 @@ fn cached_ltoir_to_cubin(
     arch: &CudaArch,
     expected_kernels: &[&str],
 ) -> Result<CacheResult, LtoirError> {
-    cached_ltoir_to_cubin_with_compile_options(
+    cached_ltoir_to_cubin_with_options(
         source_dir,
         ltoir,
         module_name,
-        arch,
-        ArtifactCompileOptions::new(),
+        &finalization_options(arch, ArtifactCompileOptions::new()),
         expected_kernels,
     )
 }
 
-fn cached_ltoir_to_cubin_with_compile_options(
+fn cached_ltoir_to_cubin_with_options(
     source_dir: &Path,
     ltoir: &[u8],
     module_name: &str,
-    arch: &CudaArch,
-    compile_options: ArtifactCompileOptions,
+    options: &FinalizationOptions,
     expected_kernels: &[&str],
 ) -> Result<CacheResult, LtoirError> {
     let linker = LtoLinker::discover()?;
-    let options = finalization_options(arch, compile_options);
     let inputs = [NamedInput::new(module_name, ltoir)];
-    let key = linker.artifact_digest(&inputs, &options, FinalizerOutput::Cubin);
+    let key = linker.artifact_digest(&inputs, options, FinalizerOutput::Cubin);
     let build = || -> Result<BuiltArtifacts, LtoirError> {
         Ok(BuiltArtifacts::new(
-            linker.link_ltoir(&inputs, &options, FinalizerOutput::Cubin, expected_kernels)?,
+            linker.link_ltoir(&inputs, options, FinalizerOutput::Cubin, expected_kernels)?,
             None,
         ))
     };
@@ -781,6 +775,7 @@ fn nvvm_ir_cubin_cache_key_with_compile_options(
             libnvvm_sha256: Some(*libnvvm_digest),
             nvjitlink_sha256: Some(*nvjitlink_digest),
             libdevice_sha256: Sha256::digest(libdevice).into(),
+            cuda_device_runtime_sha256: None,
         },
     )
     .expect("test provenance supplies exact CUDA tool identities")
@@ -832,7 +827,9 @@ fn ltoir_cubin_cache_key_with_compile_options(
         &finalization_options(arch, compile_options),
         FinalizerOutput::Cubin,
         nvjitlink_digest,
+        None,
     )
+    .expect("a link without the device runtime has a digest")
 }
 
 fn uncached_result(artifacts: BuiltArtifacts) -> CacheResult {
@@ -923,6 +920,7 @@ pub fn load_kernel_module(
                     let nvvm_ir = read_artifact(&ll)?;
                     let compile_options = read_compile_options(&ll)?;
                     let expected_kernels = read_expected_kernels(&ll)?;
+                    reject_device_runtime_on_ptx_bridge(read_link_requirements(&ll)?)?;
                     let ptx = build_ptx_from_nvvm_ir_with_compile_options(
                         &nvvm_ir,
                         &ll.display().to_string(),
@@ -947,25 +945,28 @@ pub fn load_kernel_module(
                 .iter()
                 .map(String::as_str)
                 .collect::<Vec<_>>();
+            let requirements = read_link_requirements(&ltoir)?;
             let image = match execution_route(&emitted, &execution)? {
                 ExecutionRoute::Cubin => {
-                    cached_ltoir_to_cubin_with_compile_options(
+                    cached_ltoir_to_cubin_with_options(
                         ltoir.parent().unwrap_or_else(|| Path::new(".")),
+                        &bytes,
+                        &ltoir.display().to_string(),
+                        &requirements.apply(finalization_options(&emitted, compile_options)),
+                        &expected_kernels,
+                    )?
+                    .cubin
+                }
+                ExecutionRoute::PtxBridge => {
+                    reject_device_runtime_on_ptx_bridge(requirements)?;
+                    link_ltoir_to_ptx_parsed_with_compile_options(
                         &bytes,
                         &ltoir.display().to_string(),
                         &emitted,
                         compile_options,
                         &expected_kernels,
                     )?
-                    .cubin
                 }
-                ExecutionRoute::PtxBridge => link_ltoir_to_ptx_parsed_with_compile_options(
-                    &bytes,
-                    &ltoir.display().to_string(),
-                    &emitted,
-                    compile_options,
-                    &expected_kernels,
-                )?,
             };
             Ok(ctx.load_module_from_image(&image)?)
         }
@@ -1133,18 +1134,7 @@ fn read_expected_kernels(artifact_path: &Path) -> Result<Vec<String>, LtoirError
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            let target_path = emitted_target_path(artifact_path);
-            let emitted_by_compiler = match std::fs::read_to_string(&target_path) {
-                Ok(target) => target.lines().nth(1) == Some(COMPILE_OPTIONS_TARGET_MARKER),
-                Err(source) if source.kind() == std::io::ErrorKind::NotFound => false,
-                Err(source) => {
-                    return Err(LtoirError::Io {
-                        path: target_path,
-                        source,
-                    });
-                }
-            };
-            return if emitted_by_compiler {
+            return if emitted_by_compiler(artifact_path)? {
                 Err(LtoirError::InvalidCompileOptions {
                     path,
                     value: "required expected-kernels sidecar is missing; rebuild the device crate"
@@ -1160,6 +1150,61 @@ fn read_expected_kernels(artifact_path: &Path) -> Result<Vec<String>, LtoirError
         path,
         value: "not a cuda-oxide expected-kernels list".to_string(),
     })
+}
+
+/// What the final link of the NVVM IR or LTOIR at `artifact_path` must
+/// include, from its `<name>.requires` sidecar, under the same rule as
+/// [`read_expected_kernels`]: required for a compiler-emitted artifact, and
+/// nothing for a manual one without it.
+fn read_link_requirements(artifact_path: &Path) -> Result<LinkRequirements, LtoirError> {
+    let path = artifact_path.with_extension("requires");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return if emitted_by_compiler(artifact_path)? {
+                Err(LtoirError::InvalidCompileOptions {
+                    path,
+                    value:
+                        "required link-requirements sidecar is missing; rebuild the device crate"
+                            .to_string(),
+                })
+            } else {
+                Ok(LinkRequirements::default())
+            };
+        }
+        Err(source) => return Err(LtoirError::Io { path, source }),
+    };
+    LinkRequirements::parse_sidecar(&text).ok_or_else(|| LtoirError::InvalidCompileOptions {
+        path,
+        value: "names a link requirement this cuda-host does not support".to_string(),
+    })
+}
+
+/// Whether the compiler emitted the artifact at `artifact_path`: its `.target`
+/// carries the compile-options marker the compiler always writes.
+fn emitted_by_compiler(artifact_path: &Path) -> Result<bool, LtoirError> {
+    let target_path = emitted_target_path(artifact_path);
+    match std::fs::read_to_string(&target_path) {
+        Ok(target) => Ok(target.lines().nth(1) == Some(COMPILE_OPTIONS_TARGET_MARKER)),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(LtoirError::Io {
+            path: target_path,
+            source,
+        }),
+    }
+}
+
+/// A PTX bridge cannot carry the device runtime archive: nvJitLink does not
+/// fold archive code into PTX, and the driver does not link archives at JIT.
+fn reject_device_runtime_on_ptx_bridge(requirements: LinkRequirements) -> Result<(), LtoirError> {
+    if requirements.device_runtime {
+        Err(FinalizerError::DeviceRuntimeUnsupportedRoute {
+            route: "the PTX bridge to a newer GPU",
+        }
+        .into())
+    } else {
+        Ok(())
+    }
 }
 
 fn read_compile_options(ll_path: &Path) -> Result<ArtifactCompileOptions, LtoirError> {
@@ -1538,6 +1583,58 @@ mod tests {
             "a missing source must not gain target metadata"
         );
 
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn link_requirements_are_required_only_for_compiler_emitted_artifacts() {
+        let dir = temp_dir("link_requirements");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ll = dir.join("kernel.ll");
+        std::fs::write(&ll, b"ir").unwrap();
+
+        // A manual artifact without a sidecar has no requirements.
+        assert_eq!(
+            read_link_requirements(&ll).unwrap(),
+            LinkRequirements::default()
+        );
+
+        // A compiler-emitted one must carry its sidecar.
+        std::fs::write(
+            dir.join("kernel.target"),
+            format!("sm_120\n{COMPILE_OPTIONS_TARGET_MARKER}\n"),
+        )
+        .unwrap();
+        assert!(matches!(
+            read_link_requirements(&ll),
+            Err(LtoirError::InvalidCompileOptions { .. })
+        ));
+
+        let device_runtime = LinkRequirements {
+            device_runtime: true,
+        };
+        std::fs::write(dir.join("kernel.requires"), device_runtime.sidecar_text()).unwrap();
+        assert_eq!(read_link_requirements(&ll).unwrap(), device_runtime);
+        assert!(matches!(
+            reject_device_runtime_on_ptx_bridge(device_runtime),
+            Err(LtoirError::Finalizer(
+                FinalizerError::DeviceRuntimeUnsupportedRoute { .. }
+            ))
+        ));
+
+        // A requirement this reader does not know fails closed.
+        std::fs::write(
+            dir.join("kernel.requires"),
+            format!(
+                "{}\na-future-requirement\n",
+                cuda_artifact_finalizer::LINK_REQUIREMENTS_SIDECAR_HEADER
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            read_link_requirements(&ll),
+            Err(LtoirError::InvalidCompileOptions { .. })
+        ));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

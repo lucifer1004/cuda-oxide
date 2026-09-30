@@ -10,6 +10,7 @@
 //! build-time materialization and runtime fallback use the same typed target,
 //! FMA, debug, input-order, validation, and provenance rules.
 
+mod device_runtime;
 mod diagnostics;
 mod entries;
 mod link;
@@ -17,8 +18,10 @@ mod nvvm;
 mod options;
 mod provenance;
 mod ptx;
+mod requirements;
 mod validation;
 
+pub use device_runtime::{CUDA_DEVICE_RUNTIME_ENV, DeviceRuntimeArchive};
 pub use diagnostics::KernelResourceUsage;
 pub use entries::{
     EXPECTED_KERNELS_SIDECAR_HEADER, cubin_entry_names, expected_kernels_sidecar_text,
@@ -33,6 +36,7 @@ pub use provenance::{
     MaterializerHandshakeV1, PinnedToolProvenance, ToolFileIdentity, ToolProvenance, recipe_digest,
 };
 pub use ptx::PtxAssembler;
+pub use requirements::{LINK_REQUIREMENTS_SIDECAR_HEADER, LinkRequirements};
 pub use validation::is_valid_cubin;
 
 use provenance::common_provenance_digest;
@@ -148,6 +152,24 @@ pub enum FinalizerError {
         missing: Vec<String>,
         /// Number of entry points the output does define.
         present: usize,
+    },
+
+    /// The CUDA device runtime archive could not be read.
+    #[error(
+        "Could not read the CUDA device runtime archive (libcudadevrt.a) next to the loaded nvJitLink. Set CUDA_OXIDE_CUDADEVRT or install the CUDA Toolkit's device runtime. Tried: {tried}"
+    )]
+    DeviceRuntimeNotFound {
+        /// Path that was tried, or why none could be.
+        tried: String,
+    },
+
+    /// Only an LTOIR link to cubin can include the device runtime archive:
+    /// nvJitLink cannot fold archive code into PTX output, and the CUDA driver
+    /// cannot link an archive when it JIT-compiles PTX.
+    #[error("the CUDA device runtime can only be linked into a cubin from LTOIR, not {route}")]
+    DeviceRuntimeUnsupportedRoute {
+        /// The requested link route.
+        route: &'static str,
     },
 
     /// The entry points of a linked image could not be read, so the expected
@@ -308,6 +330,7 @@ impl Finalizer {
             libnvvm_sha256: self.compiler.libnvvm_digest(),
             nvjitlink_sha256: self.linker.nvjitlink_digest(),
             libdevice_sha256: self.compiler.libdevice_digest(),
+            cuda_device_runtime_sha256: None,
         }
     }
 
@@ -330,13 +353,17 @@ impl Finalizer {
         options: &FinalizationOptions,
         output: FinalizerOutput,
     ) -> Option<[u8; 32]> {
+        let mut provenance = self.provenance();
+        if options.links_device_runtime() {
+            provenance.cuda_device_runtime_sha256 = self.linker.device_runtime_digest();
+        }
         nvvm_ir_artifact_digest_with_provenance(
             module_name,
             ltoir_module_name,
             nvvm_ir,
             options,
             output,
-            self.provenance(),
+            provenance,
         )
     }
 }
@@ -365,7 +392,8 @@ pub fn nvvm_ir_artifact_digest_with_provenance(
         options,
         output,
         &provenance.nvjitlink_sha256?,
-    );
+        provenance.cuda_device_runtime_sha256.as_ref(),
+    )?;
     Some(
         provenance::StableDigest::new()
             .field("recipe", recipe_digest())
@@ -376,14 +404,23 @@ pub fn nvvm_ir_artifact_digest_with_provenance(
     )
 }
 
-/// Digest an ordered LTOIR link from an established exact linker identity.
+/// Digest an ordered LTOIR link from an established exact linker identity,
+/// or `None` when the link includes the device runtime archive and its digest
+/// is unknown.
 pub fn ltoir_artifact_digest_with_provenance(
     inputs: &[NamedInput<'_>],
     options: &FinalizationOptions,
     output: FinalizerOutput,
     nvjitlink_sha256: &[u8; 32],
-) -> [u8; 32] {
-    link::ltoir_artifact_digest_parts(inputs, options, output, nvjitlink_sha256)
+    cuda_device_runtime_sha256: Option<&[u8; 32]>,
+) -> Option<[u8; 32]> {
+    link::ltoir_artifact_digest_parts(
+        inputs,
+        options,
+        output,
+        nvjitlink_sha256,
+        cuda_device_runtime_sha256,
+    )
 }
 
 fn validate_name(name: &str) -> Result<(), FinalizerError> {
@@ -508,6 +545,81 @@ entry:
                 "{output:?}: {error}"
             );
         }
+    }
+
+    /// A kernel calling the device-side `cudaMalloc`, which only the device
+    /// runtime archive defines. Without the archive the link cannot resolve
+    /// it; with it the call links.
+    const DEVICE_MALLOC_NVVM_IR: &[u8] = br#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-i128:128:128-f32:32:32-f64:64:64-v16:16:16-v32:32:32-v64:64:64-v128:128:128-n16:32:64"
+target triple = "nvptx64-nvidia-cuda"
+
+@llvm.used = appending global [1 x i8*] [i8* bitcast (void (i8**, i32*)* @launch to i8*)], section "llvm.metadata"
+
+declare i32 @cudaMalloc(i8**, i64)
+
+define void @launch(i8** %allocation, i32* %status) {
+entry:
+  %result = call i32 @cudaMalloc(i8** %allocation, i64 64)
+  store i32 %result, i32* %status
+  ret void
+}
+
+!nvvm.annotations = !{!0}
+!nvvmir.version = !{!1}
+!0 = !{void (i8**, i32*)* @launch, !"kernel", i32 1}
+!1 = !{i32 2, i32 0, i32 3, i32 1}
+"#;
+
+    #[test]
+    #[ignore = "requires discoverable CUDA Toolkit libNVVM, nvJitLink, libdevice, and libcudadevrt.a"]
+    fn live_device_runtime_archive_resolves_calls_that_otherwise_drop_the_kernel() {
+        let finalizer = Finalizer::discover().unwrap();
+        let options = FinalizationOptions::new("sm_86".parse().unwrap());
+        let ltoir = finalizer
+            .compiler()
+            .compile_nvvm_ir_to_ltoir("launch.ll", DEVICE_MALLOC_NVVM_IR, &options)
+            .unwrap();
+        let input = [NamedInput::new("launch.ltoir", &ltoir)];
+
+        // Without the archive the call is unresolved: nvJitLink rejects the
+        // link or drops the kernel, depending on the toolkit.
+        let without = finalizer
+            .link_ltoir(&input, &options, FinalizerOutput::Cubin, &["launch"])
+            .unwrap_err();
+        assert!(
+            matches!(
+                without,
+                FinalizerError::NvJitLink(_) | FinalizerError::MissingKernels { .. }
+            ),
+            "{without}"
+        );
+
+        let with_runtime = options.clone().with_device_runtime(true);
+        let cubin = finalizer
+            .link_ltoir(&input, &with_runtime, FinalizerOutput::Cubin, &["launch"])
+            .unwrap();
+        // The archive brings its own helper kernels along.
+        assert!(
+            cubin_entry_names(&cubin)
+                .unwrap()
+                .iter()
+                .any(|entry| entry == "launch")
+        );
+        let archive = finalizer.linker().device_runtime().unwrap();
+        assert!(archive.path().ends_with("libcudadevrt.a"));
+        assert!(
+            finalizer
+                .linker()
+                .artifact_digest(&input, &with_runtime, FinalizerOutput::Cubin)
+                .is_some()
+                || finalizer.linker().nvjitlink_digest().is_none()
+        );
+
+        assert!(matches!(
+            finalizer.link_ltoir(&input, &with_runtime, FinalizerOutput::Ptx, &["launch"]),
+            Err(FinalizerError::DeviceRuntimeUnsupportedRoute { .. })
+        ));
     }
 
     /// Legacy-dialect NVVM IR for a kernel that ptxas must spill: `values`

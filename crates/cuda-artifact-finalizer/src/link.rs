@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use crate::device_runtime::DeviceRuntimeArchive;
 use crate::diagnostics::{KernelResourceUsage, parse_ptxas_resource_usage};
 use crate::entries::require_expected_kernels;
 use crate::nvvm::{loaded_tool_digest_with_expected, report_changed_tool};
@@ -19,6 +20,15 @@ use std::sync::{Arc, Mutex, OnceLock};
 struct LoadedLinkerTool {
     library: Arc<LibNvJitLink>,
     digest: Option<[u8; 32]>,
+    /// The device runtime archive next to this nvJitLink, read on first use.
+    device_runtime: OnceLock<Arc<DeviceRuntimeArchive>>,
+}
+
+/// One nvJitLink input with its kind, in link order.
+#[derive(Clone, Copy)]
+struct TypedInput<'a> {
+    input: NamedInput<'a>,
+    kind: InputType,
 }
 
 static LINKER_TOOL: OnceLock<Arc<LoadedLinkerTool>> = OnceLock::new();
@@ -73,6 +83,22 @@ impl LtoLinker {
             report_changed_tool("nvJitLink");
             None
         }
+    }
+
+    /// The device runtime archive from this linker's toolkit, read once.
+    pub fn device_runtime(&self) -> Result<Arc<DeviceRuntimeArchive>, FinalizerError> {
+        if let Some(archive) = self.tool.device_runtime.get() {
+            return Ok(Arc::clone(archive));
+        }
+        let archive = Arc::new(DeviceRuntimeArchive::discover(
+            self.tool.library.loaded_path(),
+        )?);
+        Ok(Arc::clone(self.tool.device_runtime.get_or_init(|| archive)))
+    }
+
+    /// Digest of the device runtime archive, when it can be read.
+    pub fn device_runtime_digest(&self) -> Option<[u8; 32]> {
+        self.device_runtime().ok().map(|archive| archive.sha256())
     }
 
     /// Exact route provenance, or `None` when the loaded DSO is unidentifiable.
@@ -176,6 +202,33 @@ impl LtoLinker {
         expected_kernels: &[&str],
         collect_resource_usage: bool,
     ) -> Result<LinkReport, FinalizerError> {
+        let archive = if options.links_device_runtime() {
+            if input_type != InputType::Ltoir {
+                return Err(FinalizerError::DeviceRuntimeUnsupportedRoute { route: "PTX input" });
+            }
+            if output == FinalizerOutput::Ptx {
+                return Err(FinalizerError::DeviceRuntimeUnsupportedRoute {
+                    route: "PTX output",
+                });
+            }
+            Some(self.device_runtime()?)
+        } else {
+            None
+        };
+        let mut typed = inputs
+            .iter()
+            .map(|&input| TypedInput {
+                input,
+                kind: input_type,
+            })
+            .collect::<Vec<_>>();
+        if let Some(archive) = archive.as_deref() {
+            typed.push(TypedInput {
+                input: NamedInput::new("libcudadevrt.a", archive.bytes()),
+                kind: InputType::Library,
+            });
+        }
+        let inputs = typed.as_slice();
         with_revalidated_tool_identity(
             "nvJitLink",
             self.tool.digest,
@@ -183,7 +236,6 @@ impl LtoLinker {
             || {
                 match self.run_link(
                     inputs,
-                    input_type,
                     options,
                     output,
                     expected_kernels,
@@ -197,7 +249,7 @@ impl LtoLinker {
                     Err(FinalizerError::NvJitLink(error))
                         if collect_resource_usage && error.is_unrecognized_option() =>
                     {
-                        self.run_link(inputs, input_type, options, output, expected_kernels, false)
+                        self.run_link(inputs, options, output, expected_kernels, false)
                     }
                     result => result,
                 }
@@ -207,14 +259,13 @@ impl LtoLinker {
 
     fn run_link(
         &self,
-        inputs: &[NamedInput<'_>],
-        input_type: InputType,
+        inputs: &[TypedInput<'_>],
         options: &FinalizationOptions,
         output: FinalizerOutput,
         expected_kernels: &[&str],
         collect_resource_usage: bool,
     ) -> Result<LinkReport, FinalizerError> {
-        let mut option_storage = if input_type == InputType::Ptx {
+        let mut option_storage = if inputs.iter().all(|input| input.kind == InputType::Ptx) {
             options.nvjitlink_ptx_options()
         } else {
             options.nvjitlink_ltoir_options(output)
@@ -228,7 +279,7 @@ impl LtoLinker {
             .collect::<Vec<_>>();
         let mut linker = Linker::new(&self.tool.library, &option_refs)?;
         for input in inputs {
-            linker.add(input_type, input.bytes, input.name)?;
+            linker.add(input.kind, input.input.bytes, input.input.name)?;
         }
 
         let LinkOutput { image, info_log } = match output {
@@ -266,9 +317,12 @@ impl LtoLinker {
         output: FinalizerOutput,
     ) -> Option<[u8; 32]> {
         let nvjitlink = self.nvjitlink_digest()?;
-        Some(ltoir_artifact_digest_parts(
-            inputs, options, output, &nvjitlink,
-        ))
+        let device_runtime = if options.links_device_runtime() {
+            Some(self.device_runtime_digest()?)
+        } else {
+            None
+        };
+        ltoir_artifact_digest_parts(inputs, options, output, &nvjitlink, device_runtime.as_ref())
     }
 
     /// Digest every semantic input to a PTX-to-cubin link.
@@ -355,17 +409,21 @@ fn load_linker_tool(
     let loaded = Arc::new(LoadedLinkerTool {
         library: Arc::new(library),
         digest,
+        device_runtime: OnceLock::new(),
     });
     let _ = LINKER_TOOL.set(Arc::clone(&loaded));
     Ok(loaded)
 }
 
+/// Digest of an ordered LTOIR link, or `None` when it includes the device
+/// runtime archive and the archive's digest is unknown.
 pub(crate) fn ltoir_artifact_digest_parts(
     inputs: &[NamedInput<'_>],
     options: &FinalizationOptions,
     output: FinalizerOutput,
     nvjitlink_digest: &[u8; 32],
-) -> [u8; 32] {
+    device_runtime_digest: Option<&[u8; 32]>,
+) -> Option<[u8; 32]> {
     let output_name = match output {
         FinalizerOutput::Cubin => b"elf-cubin".as_slice(),
         FinalizerOutput::Ptx => b"ptx".as_slice(),
@@ -382,9 +440,14 @@ pub(crate) fn ltoir_artifact_digest_parts(
     for option in options.nvjitlink_ltoir_options(output) {
         digest = digest.field("nvjitlink-option", option.as_bytes());
     }
-    digest
-        .field("libnvjitlink-sha256", nvjitlink_digest)
-        .finish()
+    if options.links_device_runtime() {
+        digest = digest.field("cuda-device-runtime-sha256", device_runtime_digest?);
+    }
+    Some(
+        digest
+            .field("libnvjitlink-sha256", nvjitlink_digest)
+            .finish(),
+    )
 }
 
 pub(crate) fn ptx_artifact_digest_parts(
@@ -414,15 +477,14 @@ mod tests {
         let options = FinalizationOptions::new("sm_120".parse().unwrap());
         let a = NamedInput::new("a.ltoir", b"a");
         let b = NamedInput::new("b.ltoir", b"b");
-        let baseline =
-            ltoir_artifact_digest_parts(&[a, b], &options, FinalizerOutput::Cubin, &[7; 32]);
+        let baseline = plain_digest(&[a, b], &options, FinalizerOutput::Cubin, &[7; 32]);
         assert_ne!(
             baseline,
-            ltoir_artifact_digest_parts(&[b, a], &options, FinalizerOutput::Cubin, &[7; 32])
+            plain_digest(&[b, a], &options, FinalizerOutput::Cubin, &[7; 32])
         );
         assert_ne!(
             baseline,
-            ltoir_artifact_digest_parts(
+            plain_digest(
                 &[NamedInput::new("renamed.ltoir", b"a"), b],
                 &options,
                 FinalizerOutput::Cubin,
@@ -431,7 +493,7 @@ mod tests {
         );
         assert_ne!(
             baseline,
-            ltoir_artifact_digest_parts(
+            plain_digest(
                 &[a, b],
                 &FinalizationOptions::new("sm_90".parse().unwrap()),
                 FinalizerOutput::Cubin,
@@ -440,7 +502,7 @@ mod tests {
         );
         assert_ne!(
             baseline,
-            ltoir_artifact_digest_parts(
+            plain_digest(
                 &[a, b],
                 &options
                     .clone()
@@ -451,21 +513,57 @@ mod tests {
         );
         assert_ne!(
             baseline,
-            ltoir_artifact_digest_parts(&[a, b], &options, FinalizerOutput::Cubin, &[8; 32])
+            plain_digest(&[a, b], &options, FinalizerOutput::Cubin, &[8; 32])
         );
         assert_ne!(
             baseline,
-            ltoir_artifact_digest_parts(&[a, b], &options, FinalizerOutput::Ptx, &[7; 32])
+            plain_digest(&[a, b], &options, FinalizerOutput::Ptx, &[7; 32])
         );
         assert_ne!(
             baseline,
-            ltoir_artifact_digest_parts(
+            plain_digest(
                 &[a, b],
                 &options.clone().with_fma_contraction(false),
                 FinalizerOutput::Cubin,
                 &[7; 32]
             )
         );
+    }
+
+    #[test]
+    fn link_digest_binds_the_device_runtime_archive_it_includes() {
+        let options = FinalizationOptions::new("sm_120".parse().unwrap());
+        let with_runtime = options.clone().with_device_runtime(true);
+        let input = [NamedInput::new("a.ltoir", b"a")];
+        let output = FinalizerOutput::Cubin;
+        let plain = plain_digest(&input, &options, output, &[7; 32]);
+        assert_eq!(
+            ltoir_artifact_digest_parts(&input, &with_runtime, output, &[7; 32], None),
+            None,
+            "an unknown archive must leave the link uncacheable"
+        );
+        let first =
+            ltoir_artifact_digest_parts(&input, &with_runtime, output, &[7; 32], Some(&[1; 32]))
+                .unwrap();
+        let second =
+            ltoir_artifact_digest_parts(&input, &with_runtime, output, &[7; 32], Some(&[2; 32]))
+                .unwrap();
+        assert_ne!(first, plain);
+        assert_ne!(first, second);
+        assert_eq!(
+            ltoir_artifact_digest_parts(&input, &options, output, &[7; 32], Some(&[1; 32])),
+            Some(plain),
+            "a link without the archive ignores its digest"
+        );
+    }
+
+    fn plain_digest(
+        inputs: &[NamedInput<'_>],
+        options: &FinalizationOptions,
+        output: FinalizerOutput,
+        nvjitlink: &[u8; 32],
+    ) -> [u8; 32] {
+        ltoir_artifact_digest_parts(inputs, options, output, nvjitlink, None).unwrap()
     }
 
     #[test]

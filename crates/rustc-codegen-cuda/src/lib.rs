@@ -1011,6 +1011,14 @@ fn materialize_artifact_for_embedding(
     let Some(request) = request else {
         return Ok(None);
     };
+    if result.link_requirements.device_runtime {
+        return Err(
+            "--materialize-cubin cannot yet link the CUDA device runtime archive this crate's \
+             kernels call; build without it (cargo oxide interop and cuda-host's file loader \
+             link the archive from the emitted .requires sidecar)"
+                .into(),
+        );
+    }
     let debug_policy = match result.debug_kind {
         llvm_export::export::DebugKind::Off => cuda_artifact_finalizer::DebugPolicy::None,
         llvm_export::export::DebugKind::LineTables => {
