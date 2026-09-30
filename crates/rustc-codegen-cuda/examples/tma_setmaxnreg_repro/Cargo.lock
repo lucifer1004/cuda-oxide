@@ -121,6 +121,7 @@ version = "0.2.1"
 dependencies = [
  "libnvvm-sys",
  "nvjitlink-sys",
+ "ptx-parse",
  "serde",
  "sha2",
  "thiserror",
@@ -179,6 +180,8 @@ dependencies = [
  "cuda-core",
  "cuda-macros",
  "half",
+ "libc",
+ "oxide-artifacts",
  "ptx-parse",
  "sha2",
  "thiserror",
