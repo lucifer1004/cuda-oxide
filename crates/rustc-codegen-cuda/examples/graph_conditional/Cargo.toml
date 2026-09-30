@@ -1,0 +1,16 @@
+[package]
+name = "graph_conditional"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# Mark as standalone crate (not part of parent workspace)
+[workspace]
+
+# A CUDA Graph conditional node decided on the device. Build and run with:
+#   cargo oxide run graph_conditional
+
+[dependencies]
+cuda-device = { path = "../../../cuda-device" }
+cuda-host = { path = "../../../cuda-host" }
+cuda-core = "0.3.1"

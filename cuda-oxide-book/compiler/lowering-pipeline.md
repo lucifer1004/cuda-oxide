@@ -605,6 +605,14 @@ before choosing typed- or opaque-pointer NVVM IR. Explicit NVVM/LTOIR commands
 still require `--arch`; the feature-based fallback applies only when an
 ordinary build discovers that libdevice is needed.
 
+A call to a CUDA device runtime API (such as
+`cuda_device::graph::set_conditional`) changes neither the route nor the link.
+The compiler recognizes only the device runtime APIs it lists, each checked
+against its exact C signature, and each listed API records who resolves it:
+for `cudaGraphSetConditional`, the CUDA driver when it loads the module, from
+PTX or from a cubin. Any other `extern "C"` function stays an ordinary
+external symbol that a link input must define.
+
 ```{note}
 Why LLVM 21? The 2-D bulk TMA load intrinsic used by `tma_copy`,
 `gemm_sol`, and `tcgen05_matmul` gained a 10-operand form with `addrspace(7)`

@@ -768,11 +768,18 @@ fn should_emit_nvvm_ir(
 
 /// Narrow collected unresolved symbols to those the artifact cannot resolve.
 ///
-/// Under `allow_libdevice`, `__nv_*` entry points are dropped: the IR-level
+/// Device runtime APIs the CUDA driver resolves when it loads the module are
+/// dropped: standalone PTX keeps them as externs for the driver. Under
+/// `allow_libdevice`, `__nv_*` entry points are dropped too: the IR-level
 /// `llvm-link` step further down resolves them against `libdevice.10.bc`.
 /// Every other unresolved symbol still fails the compilation, so
 /// `UnsupportedLinking` keeps its meaning for device externs.
 fn unlinkable_symbols(mut symbols: Vec<String>, allow_libdevice: bool) -> Vec<String> {
+    symbols.retain(|symbol| {
+        !dialect_mir::cuda_runtime::device_runtime_api(symbol).is_some_and(|api| {
+            api.resolution == dialect_mir::cuda_runtime::DeviceRuntimeResolution::Driver
+        })
+    });
     if allow_libdevice {
         symbols.retain(|symbol| !crate::export::is_libdevice_symbol(symbol));
     }
@@ -1264,6 +1271,21 @@ mod tests {
             unlinkable_symbols(symbols, true),
             vec!["my_device_extern".to_string(), "vprintf".to_string()],
             "device externs still fail the compilation"
+        );
+    }
+
+    #[test]
+    fn standalone_ptx_leaves_driver_resolved_runtime_apis_to_the_driver() {
+        let symbols = vec![
+            dialect_mir::cuda_runtime::GRAPH_SET_CONDITIONAL
+                .symbol
+                .to_string(),
+            "cudaGraphLaunch".to_string(),
+        ];
+        assert_eq!(
+            unlinkable_symbols(symbols, false),
+            vec!["cudaGraphLaunch".to_string()],
+            "an unadmitted runtime symbol still fails the compilation"
         );
     }
 
